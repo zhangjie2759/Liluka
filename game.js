@@ -66,7 +66,11 @@ const ctx = canvas.getContext('2d')
 const systemInfo = GAME_API.getSystemInfoSync()
 const W = systemInfo.windowWidth
 const H = systemInfo.windowHeight
-const DPR = systemInfo.pixelRatio || 1
+// iPhone / Safari 对超高清 canvas 和大量图片更敏感，网页端把 DPR 控制在 2 以内，
+// 画面仍然清晰，但能明显降低白屏 / 网络连接丢失 / WebKit 中断的概率。
+const DPR = IS_WEB
+  ? Math.min(systemInfo.pixelRatio || 1, 2)
+  : (systemInfo.pixelRatio || 1)
 
 // 用真实像素创建高清 canvas
 canvas.width = W * DPR
@@ -753,6 +757,10 @@ function startGame() {
   comboMessage = ''
 
   resetRecords()
+
+  // 点开始后再分批加载图片，避免首页刚打开就把 iPhone 的网络/内存打满。
+  preloadGameImages()
+
   startMeal(0)
   render()
 }
@@ -1272,26 +1280,38 @@ function addButton(id, text, x, y, w, h, fill, color, fontSize) {
 const imageCache = {}
 
 // =========================
-// 图片预加载
-// 目的：进入游戏前先把所有卡牌图片加载好，避免抽牌时先闪一下旧版文字卡。
-// 如果某张图片路径错误或缺失，也不会卡死，会用“图片缺失”占位卡继续运行。
+// 图片加载策略
+// 原版是在首页一次性预加载全部卡牌图片。
+// 安卓一般能扛住，但 iPhone Safari / 微信 WebView 可能会因为瞬间请求太多高清 PNG，
+// 直接提示“网络连接已丢失”或白屏。
+//
+// 新策略：
+// 1. 首页不抢加载全部图片，先保证页面能打开。
+// 2. 点开始后再分批加载，每批少量图片。
+// 3. 抽到某张卡时仍会按需加载，没加载完就显示“加载中”占位。
 // =========================
 let imagePreloadStarted = false
+let imagePreloadIndex = 0
+let imagePreloadTimer = null
+
+const IMAGE_PRELOAD_BATCH_SIZE = 2
+const IMAGE_PRELOAD_BATCH_DELAY = 220
 
 function getAllGameImagePaths() {
   const paths = []
   const seen = {}
 
-  Object.keys(CARD_IMAGE_PATHS).forEach(name => {
-    const src = CARD_IMAGE_PATHS[name]
+  // 背面图优先。夜宵预览和对手暗牌会先用到背面，先加载它们更稳定。
+  Object.keys(CARD_BACK_PATHS).forEach(type => {
+    const src = CARD_BACK_PATHS[type]
     if (src && !seen[src]) {
       seen[src] = true
       paths.push(src)
     }
   })
 
-  Object.keys(CARD_BACK_PATHS).forEach(type => {
-    const src = CARD_BACK_PATHS[type]
+  Object.keys(CARD_IMAGE_PATHS).forEach(name => {
+    const src = CARD_IMAGE_PATHS[name]
     if (src && !seen[src]) {
       seen[src] = true
       paths.push(src)
@@ -1324,15 +1344,37 @@ function areGameImagesReady() {
   return getImagePreloadProgress().done
 }
 
+function preloadNextImageBatch() {
+  const paths = getAllGameImagePaths()
+
+  let loadedThisBatch = 0
+
+  while (imagePreloadIndex < paths.length && loadedThisBatch < IMAGE_PRELOAD_BATCH_SIZE) {
+    const src = paths[imagePreloadIndex]
+    getGameImage(src)
+    imagePreloadIndex += 1
+    loadedThisBatch += 1
+  }
+
+  if (imagePreloadIndex < paths.length) {
+    imagePreloadTimer = setTimeout(preloadNextImageBatch, IMAGE_PRELOAD_BATCH_DELAY)
+  } else {
+    imagePreloadTimer = null
+  }
+}
+
 function preloadGameImages() {
   if (imagePreloadStarted) return
 
   imagePreloadStarted = true
-  const paths = getAllGameImagePaths()
+  imagePreloadIndex = 0
 
-  paths.forEach(src => {
-    getGameImage(src)
-  })
+  if (imagePreloadTimer) {
+    clearTimeout(imagePreloadTimer)
+    imagePreloadTimer = null
+  }
+
+  preloadNextImageBatch()
 }
 
 function getGameImage(src) {
@@ -2040,9 +2082,7 @@ function drawResultScreen() {
 function drawStartScreen() {
   buttons = []
 
-  preloadGameImages()
   const preloadProgress = getImagePreloadProgress()
-  const preloadDone = preloadProgress.done
 
   ctx.clearRect(0, 0, W, H)
 
@@ -2150,40 +2190,36 @@ function drawStartScreen() {
     17
   )
 
-  // 底部开始按钮：图片未预加载完成时不进入游戏，避免卡牌闪旧版占位。
-  const startButtonText = preloadDone
-    ? L('开始游戏', 'Start Game')
-    : L(
-        `图片加载中 ${preloadProgress.loaded + preloadProgress.failed}/${preloadProgress.total}`,
-        `Loading images ${preloadProgress.loaded + preloadProgress.failed}/${preloadProgress.total}`
-      )
-
+  // 底部开始按钮：不再等待全部图片加载完。
+  // 这样 iPhone 可以先进入页面，卡图会在开始后分批加载。
   addButton(
-    preloadDone ? 'start' : 'loading',
-    startButtonText,
+    'start',
+    L('开始游戏', 'Start Game'),
     32,
     H - SAFE_BOTTOM - 112,
     W - 64,
     62,
-    preloadDone ? '#111' : '#777',
+    '#111',
     '#fff',
-    preloadDone ? 24 : 18
+    24
   )
 
-  if (preloadDone && preloadProgress.failed > 0) {
-    drawText(
-      L(
-        `有 ${preloadProgress.failed} 张图片未加载，将显示占位卡`,
-        `${preloadProgress.failed} images failed. Placeholder cards will be shown`
-      ),
-      W / 2,
-      H - SAFE_BOTTOM - 42,
-      11,
-      '#E94335',
-      'center',
-      'bold'
-    )
-  }
+  const progressText = imagePreloadStarted
+    ? L(
+        `图片分批加载 ${preloadProgress.loaded + preloadProgress.failed}/${preloadProgress.total}`,
+        `Batch loading images ${preloadProgress.loaded + preloadProgress.failed}/${preloadProgress.total}`
+      )
+    : L('图片将在开始后分批加载', 'Images load in small batches after start')
+
+  drawText(
+    progressText,
+    W / 2,
+    H - SAFE_BOTTOM - 42,
+    11,
+    preloadProgress.failed > 0 ? '#E94335' : '#777',
+    'center',
+    'bold'
+  )
 }
 // =========================
 // 主渲染
@@ -2247,11 +2283,6 @@ if (id === 'sidebar') {
   return
 }
 if (id === 'start') {
-  if (!areGameImagesReady()) {
-    render()
-    return
-  }
-
   startGame()
   return
 }
